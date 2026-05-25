@@ -23,7 +23,7 @@ CONFIG = {
     "env_feat_dim": 8,
     "num_gaussians": 5,
     "batch_size": 64,
-    "epochs": 2,               # keep it low for GitHub Actions free tier
+    "epochs": 2,
     "lr": 3e-4,
     "rmt_out_dim": 64,
     "gp_drift_dim": 32,
@@ -45,7 +45,7 @@ class CSVDataset(Dataset):
         nxt  = self.draws[idx + CONFIG["history_len"]]
         return torch.tensor(hist.flatten() + 1, dtype=torch.long), torch.tensor(nxt, dtype=torch.long)
 
-# ---------- All model classes (copy exactly from the last working Streamlit app) ----------
+# ---------- All model classes (unchanged from previous) ----------
 class AirMixPhysicsEngine(nn.Module):
     def __init__(self, num_balls=49):
         super().__init__()
@@ -184,11 +184,19 @@ class LottOracleInverted(nn.Module):
         alphas = alpha_base * conc
         return mix_coeffs, alphas
 
-# ---------- Training function ----------
+# ---------- Training function (FIXED) ----------
 def train_and_predict(csv_path):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     df = pd.read_csv(csv_path)
+    print(f"Loaded {len(df)} draws from {csv_path}")
+
+    # Prepare dataset for training
     dataset = CSVDataset(df)
+    num_samples = len(dataset)
+    print(f"Number of training sequences: {num_samples}")
+    if num_samples == 0:
+        raise ValueError(f"Not enough draws! Need more than {CONFIG['history_len']} draws.")
+
     loader = DataLoader(dataset, batch_size=CONFIG["batch_size"], shuffle=True)
     model = LottOracleInverted().to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=CONFIG["lr"])
@@ -212,18 +220,23 @@ def train_and_predict(csv_path):
             total_loss += loss.item()
         print(f"Epoch {epoch+1}: avg loss = {total_loss/len(loader):.4f}")
 
+    # --- Build the last history sequence DIRECTLY from df (no dataset indexing) ---
     model.eval()
     with torch.no_grad():
+        # Use the raw DataFrame, already sorted ascending
+        draws_arr = df[["n1","n2","n3","n4","n5","n6"]].values - 1  # 0‑indexed
+        # Last 50 draws as a sequence
+        last_50 = draws_arr[-CONFIG["history_len"]:]               # shape (50,6)
+        last_hist_tensor = torch.tensor(last_50.flatten() + 1, dtype=torch.long)  # (300,)
+        hist = last_hist_tensor.unsqueeze(0).to(device)            # (1,300)
+
         masses, _ = model.physics()
         masses_g = masses.cpu().numpy() * 1000.0
 
-        last_hist, _ = dataset[-1]
-        hist = last_hist.unsqueeze(0).to(device)
         mix, alphas = model(hist)
         alpha_sums = alphas.sum(dim=-1, keepdim=True)
         final_probs = (mix.unsqueeze(-1) * alphas / alpha_sums).sum(dim=1).squeeze().cpu().numpy()
 
-        # Sample 6 numbers
         sampled = np.random.choice(CONFIG["num_balls"], size=6, replace=False, p=final_probs)
         predicted_set = np.sort(sampled) + 1
 
@@ -237,14 +250,12 @@ if __name__ == "__main__":
 
     masses_g, probs, pred_set = train_and_predict(csv)
 
-    # Prepare output
     now = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
     output = {
         "timestamp": now,
         "predicted_set": pred_set,
         "top10_overweighted": []
     }
-    # Top 10 edges
     uniform = 1.0 / CONFIG["num_balls"]
     edges = probs - uniform
     top_idx = np.argsort(edges)[-10:][::-1]
@@ -255,7 +266,6 @@ if __name__ == "__main__":
             "edge": round(float(edges[idx]), 5)
         })
 
-    # Write JSON and a human‑readable file
     with open("prediction.json", "w") as f:
         json.dump(output, f, indent=2)
 
