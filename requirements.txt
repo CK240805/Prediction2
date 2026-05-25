@@ -4,4 +4,4 @@ torch
 matplotlib
 scipy
 streamlit
-sklearn
+scikit-learn
