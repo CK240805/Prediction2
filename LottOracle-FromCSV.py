@@ -21,7 +21,7 @@ from scipy.special import logsumexp
 # CONFIGURATION
 # =============================================================================
 CSV_FILE = "toto_results.csv"   # <-- your file
-HISTORY_LEN = 1189                    # draws used for mass estimation
+HISTORY_LEN = 1188                    # draws used for mass estimation
 CONVERGENCE_THRESHOLD = 1e-4
 MAX_SIM_DRAWS = 14_000_000
 BATCH_SIZE = 10_000
