@@ -1,14 +1,17 @@
 #!/usr/bin/env python3
 """
-LottOracle-FromCSV
-===================
-Reads historical 6/49 draw results from a CSV file (draw_no,date,n1,...,n6,additional),
-estimates the physical bias of the air-mix machine, and runs a continuous Monte Carlo
-simulation of the drawing process until the predicted probabilities converge.
-Then outputs the predicted set for the next draw.
+LottOracle-FromCSV (Refined)
+=============================
+Reads historical 6/49 draws from CSV (draw_no,date,n1,...,n6,additional),
+estimates the physical bias of the air-mix machine with tight ball tolerances,
+and runs a Monte Carlo simulation until probabilities converge.
+Outputs the predicted next set of numbers.
 
-Ball specs: 3.3 g, 40 mm diameter.
-Physics model: top-selection air-mix → P(ball) ∝ (1/mass)^α.
+Ball specs (user‑confirmed):
+  - Mass:   3.3 g ± 0.1 g
+  - Diameter: 40 mm ± 0.1 mm
+
+Model: top‑selection air‑mix → P(ball) ∝ (1/mass)^α
 """
 
 import numpy as np
@@ -18,116 +21,94 @@ import sys
 # =============================================================================
 # CONFIGURATION
 # =============================================================================
-CSV_FILE = "toto_results.csv"   # <-- change to your filename
-HISTORY_LEN = 1189                    # number of past draws used for estimation
-ALPHA = 2.0                         # air-mix sensitivity exponent
+CSV_FILE = "toto_results.csv"   # <-- your file
+HISTORY_LEN = 50
+ALPHA = 2.0                         # turbulence sensitivity
 CONVERGENCE_THRESHOLD = 1e-4
 MAX_SIM_DRAWS = 200_000
 BATCH_SIZE = 10_000
 NUM_BALLS = 49
 DRAW_SIZE = 6
-BALL_MASS_MEAN = 3.3e-3             # kg
-BALL_MASS_TOLERANCE = 0.165e-3      # ±5%
 
-# Default environmental conditions (if not available)
-DEFAULT_TEMP = 20.0       # °C
-DEFAULT_HUMIDITY = 50.0   # %
-DEFAULT_PRESSURE = 1013.0 # hPa
+# --- NEW BALL SPECS (tight) ---
+BALL_MASS_MEAN = 3.3e-3            # kg (3.3 g)
+BALL_MASS_TOL  = 0.1e-3            # kg (±0.1 g)
+BALL_DIAMETER  = 40.0e-3           # m
+BALL_DIAM_TOL  = 0.1e-3            # m (±0.1 mm) – noted for reference
+
+# Environment defaults (if not available)
+DEFAULT_TEMP = 20.0
+DEFAULT_HUMIDITY = 50.0
+DEFAULT_PRESSURE = 1013.0
 
 # =============================================================================
-# 1. LOAD HISTORICAL DRAWS FROM CSV
+# 1. LOAD HISTORICAL DRAWS
 # =============================================================================
 def load_draws_from_csv(filepath):
-    """
-    Reads CSV with columns: draw_no, date, n1, n2, n3, n4, n5, n6, additional
-    Returns: draws (N, 6) as 0-indexed integers, sorted by draw_no/date.
-    """
     df = pd.read_csv(filepath)
-    # Ensure columns exist
     required = ["draw_no", "date", "n1", "n2", "n3", "n4", "n5", "n6"]
     for col in required:
         if col not in df.columns:
-            raise ValueError(f"Missing required column: {col}")
-
-    # Sort by draw_no or date (both work)
+            raise ValueError(f"Missing column: {col}")
     df = df.sort_values("draw_no").reset_index(drop=True)
-
-    # Extract numbers (convert to 0-indexed)
-    draws = df[["n1", "n2", "n3", "n4", "n5", "n6"]].values - 1  # 0..48
-
+    draws = df[["n1", "n2", "n3", "n4", "n5", "n6"]].values - 1
     print(f"Loaded {len(draws)} draws from {filepath}")
     return draws
 
 # =============================================================================
-# 2. STATE ESTIMATION: INFER BALL MASSES FROM DRAW FREQUENCIES
+# 2. MASS ESTIMATION FROM FREQUENCIES (clipped to new tolerance)
 # =============================================================================
 def estimate_ball_masses(draws_history):
     """
-    Given an array of past draws (H, 6), 0-indexed,
-    estimate the mass of each ball using the inverse frequency rule.
-    Lighter balls appear more often in top-selection air-mix.
-    Returns: masses (49,) in kg.
+    Infer ball masses from occurrence frequencies.
+    Heavier → less likely in top‑selection air‑mix.
     """
     H = len(draws_history)
     counts = np.zeros(NUM_BALLS)
     for draw in draws_history:
         for ball in draw:
             counts[ball] += 1
-    # Avoid zero counts
     counts = counts + 1e-6
     freq = counts / (H * DRAW_SIZE)
 
-    # Mass ∝ 1 / freq (lighter → higher freq)
+    # Inverse mapping: mass ∝ 1/freq
     raw_mass = 1.0 / (freq + 1e-8)
-    # Normalize to mean = BALL_MASS_MEAN
     raw_mass = raw_mass / np.mean(raw_mass) * BALL_MASS_MEAN
 
-    # Clip to ±5% tolerance around the mean
+    # Clip to user‑specified ±0.1 g
     raw_mass = np.clip(raw_mass,
-                       BALL_MASS_MEAN - BALL_MASS_TOLERANCE,
-                       BALL_MASS_MEAN + BALL_MASS_TOLERANCE)
+                       BALL_MASS_MEAN - BALL_MASS_TOL,
+                       BALL_MASS_MEAN + BALL_MASS_TOL)
     return raw_mass
 
 # =============================================================================
-# 3. PHYSICS ENGINE: ANALYTICAL AIR-MIX MODEL
+# 3. PHYSICS ENGINE: ANALYTICAL AIR‑MIX PROBABILITY
 # =============================================================================
 def compute_physics_probabilities(masses, env):
     """
-    Given current ball masses (49,) and environment dict,
-    compute the draw probability vector using the air-mix bias.
-    P(ball) ∝ (1/mass)^α
+    P(ball) ∝ (1/mass)^α.
+    env is passed for future use (air density, charge), but not yet implemented.
     """
-    # α is a fixed constant; in a real system it would be calibrated.
     alpha = ALPHA
     weight = (1.0 / masses) ** alpha
     prob = weight / np.sum(weight)
     return prob
 
 # =============================================================================
-# 4. CONTINUOUS MONTE CARLO SIMULATION UNTIL CONVERGENCE
+# 4. CONTINUOUS MONTE CARLO SIMULATION
 # =============================================================================
-def simulate_until_convergence(prob_vector,
-                               threshold=CONVERGENCE_THRESHOLD,
-                               max_iters=MAX_SIM_DRAWS,
-                               batch_size=BATCH_SIZE):
-    """
-    Samples virtual draws from prob_vector (using np.random.choice without
-    replacement per draw) until the empirical distribution stabilises.
-    Returns: final empirical probabilities, total draws performed.
-    """
+def simulate_until_convergence(prob_vector, threshold=CONVERGENCE_THRESHOLD,
+                               max_iters=MAX_SIM_DRAWS, batch_size=BATCH_SIZE):
     counts = np.zeros(NUM_BALLS, dtype=np.int64)
     prev_probs = None
     iteration = 0
     delta = None
 
     while iteration < max_iters:
-        # Sample batch of draws
-        batch_draws = []
-        for _ in range(batch_size):
-            draw = np.random.choice(NUM_BALLS, size=DRAW_SIZE,
-                                    replace=False, p=prob_vector)
-            batch_draws.append(draw)
-        batch_draws = np.array(batch_draws)  # (batch_size, 6)
+        batch_draws = np.array([
+            np.random.choice(NUM_BALLS, size=DRAW_SIZE, replace=False, p=prob_vector)
+            for _ in range(batch_size)
+        ])
         for ball in batch_draws.flat:
             counts[ball] += 1
 
@@ -147,63 +128,50 @@ def simulate_until_convergence(prob_vector,
 
     final_total = (iteration + 1) * batch_size
     if iteration >= max_iters:
-        print("Warning: maximum iterations reached without full convergence.")
+        print("Warning: max iterations reached without full convergence.")
     else:
-        print(f"Converged after {final_total} virtual draws. Final max delta = {delta:.6f}")
+        print(f"Converged after {final_total} virtual draws. Final delta = {delta:.6f}")
     return empirical_probs, final_total
 
 # =============================================================================
 # 5. MAIN PIPELINE
 # =============================================================================
 def main():
-    # Load data
     draws = load_draws_from_csv(CSV_FILE)
-
     if len(draws) < HISTORY_LEN:
-        print(f"Error: Need at least {HISTORY_LEN} draws, but only {len(draws)} available.")
+        print(f"Need at least {HISTORY_LEN} draws, only {len(draws)} available.")
         sys.exit(1)
 
-    # Use the last HISTORY_LEN draws for state estimation
-    recent_draws = draws[-HISTORY_LEN:]   # shape (HISTORY_LEN, 6)
+    recent_draws = draws[-HISTORY_LEN:]
 
-    # Estimate current ball masses
-    estimated_masses = estimate_ball_masses(recent_draws)
-    print("\nEstimated ball masses (first 10):")
+    # Estimate masses (now clipped to ±0.1 g)
+    masses = estimate_ball_masses(recent_draws)
+    print("\nEstimated ball masses (first 10, in grams):")
     for i in range(10):
-        print(f"  Ball {i+1:02d}: {estimated_masses[i]*1000:.3f} g")
+        print(f"  Ball {i+1:02d}: {masses[i]*1000:.3f} g")
 
-    # Environmental conditions (if you have real data, replace these)
-    env = {
-        "temperature": DEFAULT_TEMP,
-        "humidity": DEFAULT_HUMIDITY,
-        "pressure": DEFAULT_PRESSURE
-    }
-    # (Environment affects air density, but we keep it simple for now)
+    env = {"temperature": DEFAULT_TEMP, "humidity": DEFAULT_HUMIDITY,
+           "pressure": DEFAULT_PRESSURE}
 
-    # Compute physical probability vector
-    prob_vec = compute_physics_probabilities(estimated_masses, env)
-    print("\nInitial physics-based probabilities (first 10):")
+    prob_vec = compute_physics_probabilities(masses, env)
+    print("\nInitial physics probabilities (first 10):")
     for i in range(10):
         print(f"  Ball {i+1:02d}: {prob_vec[i]:.4f}")
 
-    # Run continuous simulation to refine probabilities
-    print("\n--- Starting continuous Monte Carlo simulation ---")
-    final_probs, total_simulated = simulate_until_convergence(prob_vec)
+    print("\n--- Continuous Monte Carlo simulation ---")
+    final_probs, total_sim = simulate_until_convergence(prob_vec)
 
-    # Predict the next set: top 6 most probable balls
-    top_indices = np.argsort(final_probs)[-DRAW_SIZE:][::-1]
-    predicted_balls = top_indices + 1  # back to 1-indexed
-    predicted_balls.sort()
-    print(f"\nPredicted set for next draw: {predicted_balls}")
+    top_idx = np.argsort(final_probs)[-DRAW_SIZE:][::-1]
+    predicted = top_idx + 1
+    predicted.sort()
+    print(f"\nPredicted next set: {predicted}")
 
-    print("\nFinal probability distribution (top 10):")
+    print("\nTop 10 final probabilities:")
     for rank, idx in enumerate(np.argsort(final_probs)[-10:][::-1]):
         print(f"  {rank+1}. Ball {idx+1:02d}: {final_probs[idx]:.4f}")
 
-    print(f"\nTotal virtual draws performed: {total_simulated}")
-    print("Disclaimer: This is an educational demonstration based on a simplified")
-    print("physical model. Real lottery outcomes are unpredictable without illegal")
-    print("access to the machine's internal state.")
+    print(f"\nTotal virtual draws: {total_sim}")
+    print("Disclaimer: educational demo. Real lottery outcomes remain unpredictable.")
 
 if __name__ == "__main__":
     main()
