@@ -1,0 +1,63 @@
+{
+  "timestamp": "2026-05-25 07:14 UTC",
+  "predicted_set": [
+    3,
+    8,
+    16,
+    23,
+    29,
+    39
+  ],
+  "top10_overweighted": [
+    {
+      "ball": 15,
+      "probability": 0.02333,
+      "edge": 0.00292
+    },
+    {
+      "ball": 28,
+      "probability": 0.02261,
+      "edge": 0.0022
+    },
+    {
+      "ball": 35,
+      "probability": 0.02254,
+      "edge": 0.00213
+    },
+    {
+      "ball": 49,
+      "probability": 0.02235,
+      "edge": 0.00195
+    },
+    {
+      "ball": 40,
+      "probability": 0.02225,
+      "edge": 0.00184
+    },
+    {
+      "ball": 1,
+      "probability": 0.02217,
+      "edge": 0.00176
+    },
+    {
+      "ball": 8,
+      "probability": 0.02217,
+      "edge": 0.00176
+    },
+    {
+      "ball": 22,
+      "probability": 0.02192,
+      "edge": 0.00151
+    },
+    {
+      "ball": 46,
+      "probability": 0.02184,
+      "edge": 0.00143
+    },
+    {
+      "ball": 48,
+      "probability": 0.02168,
+      "edge": 0.00128
+    }
+  ]
+}
