@@ -66,10 +66,8 @@ class RMTCollectiveModes(nn.Module):
         self.num_balls = num_balls
         self.rmt_window = rmt_window
         self.out_dim = out_dim
-        # Number of eigenvectors we can actually keep
-        self.top_k = min(out_dim, num_balls)
-        # Projection from (num_balls * top_k) to out_dim
-        self.proj = nn.Linear(num_balls * self.top_k, out_dim)
+        self.top_k = min(out_dim, num_balls)                      # 49
+        self.proj = nn.Linear(num_balls * self.top_k, out_dim)    # 2401 → 64
 
     def forward(self, hist_tokens):
         B = hist_tokens.size(0)
@@ -83,12 +81,11 @@ class RMTCollectiveModes(nn.Module):
         Xc = X - X.mean(dim=-1, keepdim=True)
         C = torch.bmm(Xc, Xc.transpose(1,2)) / (self.rmt_window - 1)
         _, eigvecs = torch.linalg.eigh(C)          # (B, 49, 49)
-        # Take the largest self.top_k eigenvectors (last columns)
         sel = eigvecs[:, :, -self.top_k:]          # (B, 49, top_k)
         flat = sel.reshape(B, -1)                  # (B, 49*top_k)
         return self.proj(flat)                     # (B, out_dim)
 
-# ---------- Other modules (unchanged) ----------
+# ---------- Other modules ----------
 class HierarchicalDriftTracker(nn.Module):
     def __init__(self, phys_dim=98, latent_dim=32):
         super().__init__()
@@ -126,7 +123,7 @@ class SetTransformerEncoder(nn.Module):
         attn_out, _ = self.attn(x, x, x)
         return self.norm(x + attn_out)
 
-# ---------- Full model ----------
+# ---------- Full model (fixed fusion dimension) ----------
 class LottOracleInverted(nn.Module):
     def __init__(self):
         super().__init__()
@@ -149,8 +146,13 @@ class LottOracleInverted(nn.Module):
                                                 CONFIG["rmt_out_dim"])
         self.gp_drift = HierarchicalDriftTracker(98, CONFIG["gp_drift_dim"])
         self.chaos_gauge = ChaosPredictabilityGauge(CONFIG["d_model"])
-        total_dim = (CONFIG["d_model"] + CONFIG["physics_state_dim"] +
-                     CONFIG["rmt_out_dim"] + CONFIG["gp_drift_dim"] + 1)
+        # CORRECTED: include env_latent dimension (d_model) in total
+        total_dim = (CONFIG["d_model"]          # seq_summary
+                     + CONFIG["physics_state_dim"]  # phys_latent
+                     + CONFIG["d_model"]            # env_latent
+                     + CONFIG["rmt_out_dim"]        # rmt_feat
+                     + CONFIG["gp_drift_dim"]       # drift_feat
+                     + 1)                           # chaos_idx
         self.fusion_proj = nn.Linear(total_dim, CONFIG["d_model"])
         self.mdn_proj = nn.Linear(CONFIG["d_model"],
                                   CONFIG["num_gaussians"] * (CONFIG["num_balls"] + 2))
@@ -177,9 +179,13 @@ class LottOracleInverted(nn.Module):
 
         env_latent = self.env_proj(torch.zeros(B, CONFIG["env_feat_dim"], device=hist_tokens.device))
         combined = torch.cat([
-            seq_summary, phys_latent, env_latent,
-            rmt_feat, drift_feat, chaos_idx
-        ], dim=1)
+            seq_summary,   # (B, 256)
+            phys_latent,   # (B, 128)
+            env_latent,    # (B, 256)
+            rmt_feat,      # (B, 64)
+            drift_feat,    # (B, 32)
+            chaos_idx      # (B, 1)
+        ], dim=1)          # total 737
         fused = F.relu(self.fusion_proj(combined))
 
         raw = self.mdn_proj(fused).view(B, CONFIG["num_gaussians"], -1)
