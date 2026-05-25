@@ -1,0 +1,40 @@
+name: LottOracle Prediction
+
+on:
+  schedule:
+    # Runs at 18:00 UTC every Monday and Thursday (adjust cron as needed)
+    - cron: '0 18 * * 1,4'
+  workflow_dispatch:  # allows manual trigger from Actions tab
+  push:
+    branches:
+      - main            # optional: trigger on push to main for testing
+
+jobs:
+  predict:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write   # needed to push back to repo
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run LottOracle prediction
+        run: python train_and_predict.py
+
+      - name: Commit updated predictions
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: "🤖 Auto-predict for next draw [skip ci]"
+          file_pattern: "prediction.json prediction.md"
+          commit_user_name: "LottOracle Bot"
+          commit_user_email: "bot@lottoracle"
