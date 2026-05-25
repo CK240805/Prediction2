@@ -21,9 +21,9 @@ from scipy.optimize import minimize
 # CONFIGURATION
 # =============================================================================
 CSV_FILE = "toto_results.csv"      # your file
-HISTORY_LEN = 200                   # minimum draws before starting cross‑validation
+HISTORY_LEN = 1188                   # minimum draws before starting cross‑validation
 CONVERGENCE_THRESHOLD = 1e-4
-MAX_SIM_DRAWS = 200_000
+MAX_SIM_DRAWS = 14_000_000
 BATCH_SIZE = 10_000
 NUM_BALLS = 49
 DRAW_SIZE = 6
