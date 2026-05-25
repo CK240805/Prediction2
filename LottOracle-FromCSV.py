@@ -18,7 +18,7 @@ import sys
 # =============================================================================
 # CONFIGURATION
 # =============================================================================
-CSV_FILE = "toto_draws.csv"   # <-- change to your filename
+CSV_FILE = "toto_results.csv"   # <-- change to your filename
 HISTORY_LEN = 1189                    # number of past draws used for estimation
 ALPHA = 2.0                         # air-mix sensitivity exponent
 CONVERGENCE_THRESHOLD = 1e-4
