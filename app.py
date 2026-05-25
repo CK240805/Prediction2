@@ -6,7 +6,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 import matplotlib.pyplot as plt
-import os
 
 # ---------- Physical constants ----------
 BALL_MASS_MEAN  = 3.3e-3
@@ -47,7 +46,7 @@ class CSVDataset(Dataset):
         nxt  = self.draws[idx + CONFIG["history_len"]]
         return torch.tensor(hist.flatten() + 1, dtype=torch.long), torch.tensor(nxt, dtype=torch.long)
 
-# ---------- Model (identical to earlier, condensed for brevity) ----------
+# ---------- Physics engine ----------
 class AirMixPhysicsEngine(nn.Module):
     def __init__(self, num_balls=49):
         super().__init__()
@@ -60,12 +59,18 @@ class AirMixPhysicsEngine(nn.Module):
         weight = 1.0 / (masses ** alpha + 1e-12)
         return masses, weight / weight.sum()
 
+# ---------- RMT (fixed) ----------
 class RMTCollectiveModes(nn.Module):
-    # ... (copy from previous full code) ...
     def __init__(self, num_balls=49, rmt_window=30, out_dim=64):
         super().__init__()
-        self.num_balls = num_balls; self.rmt_window = rmt_window; self.out_dim = out_dim
-        self.proj = nn.Linear(num_balls * out_dim, out_dim)
+        self.num_balls = num_balls
+        self.rmt_window = rmt_window
+        self.out_dim = out_dim
+        # Number of eigenvectors we can actually keep
+        self.top_k = min(out_dim, num_balls)
+        # Projection from (num_balls * top_k) to out_dim
+        self.proj = nn.Linear(num_balls * self.top_k, out_dim)
+
     def forward(self, hist_tokens):
         B = hist_tokens.size(0)
         draws = hist_tokens.view(B, CONFIG["history_len"], CONFIG["draw_size"]) - 1
@@ -74,18 +79,22 @@ class RMTCollectiveModes(nn.Module):
         for w in range(self.rmt_window):
             for s in range(CONFIG["draw_size"]):
                 multi_hot[:, w, draws[:, w, s]] = 1.0
-        X = multi_hot.permute(0, 2, 1); Xc = X - X.mean(dim=-1, keepdim=True)
+        X = multi_hot.permute(0, 2, 1)
+        Xc = X - X.mean(dim=-1, keepdim=True)
         C = torch.bmm(Xc, Xc.transpose(1,2)) / (self.rmt_window - 1)
-        _, eigvecs = torch.linalg.eigh(C)
-        top_k = min(self.out_dim, self.num_balls)
-        sel = eigvecs[:, :, -top_k:].reshape(B, -1)
-        return self.proj(sel)
+        _, eigvecs = torch.linalg.eigh(C)          # (B, 49, 49)
+        # Take the largest self.top_k eigenvectors (last columns)
+        sel = eigvecs[:, :, -self.top_k:]          # (B, 49, top_k)
+        flat = sel.reshape(B, -1)                  # (B, 49*top_k)
+        return self.proj(flat)                     # (B, out_dim)
 
+# ---------- Other modules (unchanged) ----------
 class HierarchicalDriftTracker(nn.Module):
     def __init__(self, phys_dim=98, latent_dim=32):
         super().__init__()
         self.rnn = nn.GRU(phys_dim, 128, num_layers=2, batch_first=True)
         self.output_proj = nn.Linear(128, latent_dim)
+
     def forward(self, phys_seq):
         _, h_n = self.rnn(phys_seq)
         return self.output_proj(h_n[-1])
@@ -95,7 +104,10 @@ class ChaosPredictabilityGauge(nn.Module):
         super().__init__()
         self.embed = nn.Embedding(CONFIG["num_balls"]+1, d_model, padding_idx=0)
         self.attn = nn.MultiheadAttention(d_model, 4, batch_first=True)
-        self.fc = nn.Sequential(nn.Linear(d_model, 32), nn.ReLU(), nn.Linear(32, 1), nn.Sigmoid())
+        self.fc = nn.Sequential(
+            nn.Linear(d_model, 32), nn.ReLU(), nn.Linear(32, 1), nn.Sigmoid()
+        )
+
     def forward(self, hist_tokens):
         B = hist_tokens.size(0)
         tokens = hist_tokens.view(B, CONFIG["history_len"], CONFIG["draw_size"])
@@ -109,30 +121,39 @@ class SetTransformerEncoder(nn.Module):
         super().__init__()
         self.attn = nn.MultiheadAttention(d_model, num_heads, batch_first=True)
         self.norm = nn.LayerNorm(d_model)
+
     def forward(self, x):
         attn_out, _ = self.attn(x, x, x)
         return self.norm(x + attn_out)
 
+# ---------- Full model ----------
 class LottOracleInverted(nn.Module):
     def __init__(self):
         super().__init__()
         self.physics = AirMixPhysicsEngine(CONFIG["num_balls"])
         self.physics_encoder = nn.Sequential(
-            nn.Linear(CONFIG["num_balls"]*2, 256), nn.ReLU(),
-            nn.Linear(256, CONFIG["physics_state_dim"]), nn.LayerNorm(CONFIG["physics_state_dim"]))
+            nn.Linear(CONFIG["num_balls"]*2, 256),
+            nn.ReLU(),
+            nn.Linear(256, CONFIG["physics_state_dim"]),
+            nn.LayerNorm(CONFIG["physics_state_dim"])
+        )
         self.env_proj = nn.Linear(CONFIG["env_feat_dim"], CONFIG["d_model"])
         self.ball_embed = nn.Embedding(CONFIG["num_balls"]+1, CONFIG["d_model"], padding_idx=0)
         self.draw_encoder = SetTransformerEncoder(CONFIG["d_model"], CONFIG["nhead"])
         self.temporal_transformer = nn.TransformerEncoder(
             nn.TransformerEncoderLayer(d_model=CONFIG["d_model"], nhead=CONFIG["nhead"],
                                        batch_first=True, dim_feedforward=512),
-            num_layers=CONFIG["num_transformer_layers"])
-        self.rmt_extractor = RMTCollectiveModes(CONFIG["num_balls"], CONFIG["rmt_window"], CONFIG["rmt_out_dim"])
+            num_layers=CONFIG["num_transformer_layers"]
+        )
+        self.rmt_extractor = RMTCollectiveModes(CONFIG["num_balls"], CONFIG["rmt_window"],
+                                                CONFIG["rmt_out_dim"])
         self.gp_drift = HierarchicalDriftTracker(98, CONFIG["gp_drift_dim"])
         self.chaos_gauge = ChaosPredictabilityGauge(CONFIG["d_model"])
-        total_dim = CONFIG["d_model"] + CONFIG["physics_state_dim"] + CONFIG["rmt_out_dim"] + CONFIG["gp_drift_dim"] + 1
+        total_dim = (CONFIG["d_model"] + CONFIG["physics_state_dim"] +
+                     CONFIG["rmt_out_dim"] + CONFIG["gp_drift_dim"] + 1)
         self.fusion_proj = nn.Linear(total_dim, CONFIG["d_model"])
-        self.mdn_proj = nn.Linear(CONFIG["d_model"], CONFIG["num_gaussians"] * (CONFIG["num_balls"] + 2))
+        self.mdn_proj = nn.Linear(CONFIG["d_model"],
+                                  CONFIG["num_gaussians"] * (CONFIG["num_balls"] + 2))
 
     def forward(self, hist_tokens):
         B = hist_tokens.size(0)
@@ -155,7 +176,10 @@ class LottOracleInverted(nn.Module):
         chaos_idx = self.chaos_gauge(hist_tokens)
 
         env_latent = self.env_proj(torch.zeros(B, CONFIG["env_feat_dim"], device=hist_tokens.device))
-        combined = torch.cat([seq_summary, phys_latent, env_latent, rmt_feat, drift_feat, chaos_idx], dim=1)
+        combined = torch.cat([
+            seq_summary, phys_latent, env_latent,
+            rmt_feat, drift_feat, chaos_idx
+        ], dim=1)
         fused = F.relu(self.fusion_proj(combined))
 
         raw = self.mdn_proj(fused).view(B, CONFIG["num_gaussians"], -1)
@@ -167,7 +191,7 @@ class LottOracleInverted(nn.Module):
         alphas = alpha_base * conc
         return mix_coeffs, alphas
 
-# ---------- Training function ----------
+# ---------- Training helper ----------
 def train_model(df, epochs, device):
     dataset = CSVDataset(df)
     loader = DataLoader(dataset, batch_size=CONFIG["batch_size"], shuffle=True)
@@ -181,8 +205,8 @@ def train_model(df, epochs, device):
             mix, alphas = model(hist)
             alpha_sums = alphas.sum(dim=-1, keepdim=True)
             probs = alphas / alpha_sums
-            target_oh = F.one_hot(tgt, CONFIG["num_balls"]).float()
-            log_like = (target_oh.unsqueeze(1) * torch.log(probs.unsqueeze(2) + 1e-10)).sum(-1).sum(-1)
+            tgt_oh = F.one_hot(tgt, CONFIG["num_balls"]).float()
+            log_like = (tgt_oh.unsqueeze(1) * torch.log(probs.unsqueeze(2) + 1e-10)).sum(-1).sum(-1)
             loss = -torch.logsumexp(torch.log(mix + 1e-10) + log_like, dim=-1).mean()
             optimizer.zero_grad()
             loss.backward()
@@ -210,18 +234,15 @@ if uploaded_file is not None:
 
         model.eval()
         with torch.no_grad():
-            # --- Inferred masses ---
             masses, _ = model.physics()
             masses_g = masses.cpu().numpy() * 1000.0
 
-            # --- Predicted probabilities ---
             last_hist, _ = dataset[-1]
             hist = last_hist.unsqueeze(0).to(device)
             mix, alphas = model(hist)
             alpha_sums = alphas.sum(dim=-1, keepdim=True)
             probs = (mix.unsqueeze(-1) * alphas / alpha_sums).sum(dim=1).squeeze().cpu().numpy()
 
-        # --- Plots ---
         fig1, ax1 = plt.subplots(figsize=(10,4))
         ax1.bar(range(1,50), masses_g, color='royalblue')
         ax1.axhline(y=BALL_MASS_MEAN*1000, color='gray', linestyle='--', label='Nominal 3.3 g')
@@ -238,12 +259,10 @@ if uploaded_file is not None:
         ax2.legend()
         st.pyplot(fig2)
 
-        # --- Predicted set ---
         pred_set = np.random.choice(CONFIG["num_balls"], size=6, replace=False, p=probs)
         st.subheader("🎯 Sampled Predicted Set")
         st.markdown(" ".join([f"**{n+1:02d}**" for n in np.sort(pred_set)]))
 
-        # --- Top edges ---
         edges = probs - (1/49)
         top_edges = np.argsort(edges)[-10:][::-1]
         st.subheader("🔝 Top 10 Over‑Weighted Numbers")
