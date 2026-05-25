@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
 """
-LottOracle-Kalman-Pair-Neural (Fixed)
-======================================
-Advanced 6/49 lottery prediction with Kalman filter, pairwise bias, neural corrector.
-Now includes explicit probability normalization to avoid numpy random choice errors.
+LottOracle-Advanced-Final
+=========================
+Complete lottery prediction engine with:
+- Kalman mass tracker
+- Pairwise co‑occurrence bias
+- Neural residual corrector
+- Monte Carlo set sampling (numerically stable)
 """
 
 import numpy as np
@@ -24,9 +27,6 @@ import torch.optim as optim
 # =============================================================================
 CSV_FILE = "toto_results.csv"
 MIN_HISTORY_FOR_CAL = 100
-CONVERGENCE_THRESHOLD = 1e-4
-MAX_SIM_DRAWS = 200_000
-BATCH_SIZE = 10_000
 NUM_BALLS = 49
 DRAW_SIZE = 6
 BALL_MASS_MEAN = 3.3e-3          # kg
@@ -95,7 +95,7 @@ class KalmanMassTracker:
         return self.masses.copy()
 
 # =============================================================================
-# 4. MASS FROM COUNTS (for initialisation)
+# 4. MASS FROM COUNTS
 # =============================================================================
 def masses_from_counts(counts, mean_mass=BALL_MASS_MEAN, tol=BALL_MASS_TOL):
     counts = np.maximum(counts, 1e-8)
@@ -153,9 +153,6 @@ class PairwiseBias:
     def __init__(self):
         self.params = np.zeros((NUM_BALLS, NUM_BALLS))
 
-    def set_zero(self):
-        self.params[:] = 0.0
-
     def update_from_draw(self, draw, learning_rate=0.01):
         for i in range(DRAW_SIZE):
             for j in range(i+1, DRAW_SIZE):
@@ -190,7 +187,7 @@ def apply_pairwise_bias(prob, pair_log_bias, pair_weight):
     return prob_adj
 
 # =============================================================================
-# 9. DIRICHLET-MULTINOMIAL LIKELIHOOD
+# 9. DIRICHLET-MULTINOMIAL
 # =============================================================================
 def dirichlet_multinomial_loglike(prob_vec, draw, concentration):
     alpha = concentration * prob_vec
@@ -246,7 +243,7 @@ def train_corrector(physics_logits_list, target_counts_list):
     return model
 
 # =============================================================================
-# 11. CROSS-VALIDATION LIKELIHOOD
+# 11. CROSS-VALIDATION LOG-LIKELIHOOD
 # =============================================================================
 def cv_log_likelihood(params, draws_cal, dates_cal, min_history=MIN_HISTORY_FOR_CAL):
     alpha, beta, gamma, delta, log_concentration = params
@@ -296,10 +293,10 @@ def main():
     last_date = dates.iloc[-1]
     print(f"Using {len(cal_draws)} draws for calibration.")
 
-    # Calibrate core parameters
+    # Calibrate
     alpha, beta, gamma, delta, concentration = calibrate_parameters(cal_draws, cal_dates)
 
-    # Kalman tracker over all calibration draws
+    # Kalman tracking over all calibration draws
     tracker = KalmanMassTracker()
     mass_history = []
     for draw in cal_draws:
@@ -314,7 +311,7 @@ def main():
         pair_bias.update_from_draw(draw, learning_rate=0.001)
     pair_log_bias = pair_bias.get_log_bias()
 
-    # Collect training data for neural corrector
+    # Neural corrector training
     physics_logits_list = []
     target_counts_list = []
     for i, masses_i in enumerate(mass_history):
@@ -326,28 +323,27 @@ def main():
         target_counts_list.append(np.bincount(draw_i, minlength=NUM_BALLS).astype(float))
     corrector_model = train_corrector(physics_logits_list, target_counts_list)
 
-    # Final prediction for next draw
+    # Prediction for next draw
     temp_next, hum_next = get_env_from_date(last_date)
     prob_physics = physics_probabilities(final_masses, alpha, temp_next, hum_next, beta, gamma)
     prob_w_pair = apply_pairwise_bias(prob_physics, pair_log_bias, pair_weight=0.01)
 
-    # Apply neural corrector
     corrector_model.eval()
     with torch.no_grad():
         logits_in = torch.tensor(np.log(prob_w_pair + 1e-10), dtype=torch.float32).unsqueeze(0)
         corrected_logits = corrector_model(logits_in).squeeze().numpy()
     prob_corrected = np.exp(corrected_logits - logsumexp(corrected_logits))
-    # Ensure sum to 1 exactly (fix for numpy random)
-    prob_corrected = prob_corrected / prob_corrected.sum()
+    prob_corrected = prob_corrected / prob_corrected.sum()   # exact normalisation
 
     print("\nFinal probabilities (first 10):")
     for i in range(10):
         print(f"  Ball {i+1:02d}: {prob_corrected[i]:.4f}")
 
-    # Monte Carlo set sampling
+    # Monte Carlo set sampling (with forced re‑normalisation)
     print("\n--- Monte Carlo set sampling (500k draws) ---")
     set_counter = Counter()
     p = prob_corrected.astype(np.float64)
+    p = p / p.sum()                 # ensure it sums to exactly 1
     batch_sz = 50000
     for batch_start in range(0, 500_000, batch_sz):
         actual = min(batch_sz, 500_000 - batch_start)
