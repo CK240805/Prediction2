@@ -1,15 +1,10 @@
 #!/usr/bin/env python3
 """
-LottOracle – Unknown Ball Sets (colour changes every draw)
-============================================================
-Automatically clusters historical draws into groups that correspond to
-different ball sets (colours). For each cluster, a separate physics‑based
-model (EWMA mass estimation, α calibration) is built. The final prediction
-for the next draw is the weighted average of the per‑cluster probability
-distributions (weights = cluster proportions), because the set used in the
-next draw is unknown.
-
-Physics: P(ball) ∝ (1/m)^α, with relative masses constrained to ±1%.
+LottOracle – Unknown Ball Sets (colour changes every draw) [FIXED]
+====================================================================
+Automatically clusters historical draws into groups (ball sets).
+For each cluster, a separate physics model is fitted.
+Final prediction = weighted average of per‑cluster probabilities.
 """
 
 import numpy as np
@@ -27,17 +22,16 @@ warnings.filterwarnings("ignore", category=DeprecationWarning)
 # CONFIGURATION
 # =============================================================================
 CSV_FILE = "toto_results.csv"
-MIN_HISTORY_FOR_CAL = 100          # minimum draws per cluster to start calibration
+MIN_HISTORY_FOR_CAL = 100
 NUM_BALLS = 49
 DRAW_SIZE = 6
 
-BALL_MASS_NOMINAL = 1.0            # relative scale
-BALL_MASS_TOL_REL = 0.01           # 1 % tolerance
+BALL_MASS_NOMINAL = 1.0
+BALL_MASS_TOL_REL = 0.01
 
 EWMA_DECAY = 0.98
 TREND_WINDOW = 20
-
-MAX_K = 5                          # maximum number of ball sets to consider
+MAX_K = 5
 
 # =============================================================================
 # 1. DATA LOADING
@@ -55,20 +49,13 @@ def load_draws_from_csv(filepath):
     return draws, dates
 
 # =============================================================================
-# 2. CLUSTERING DRAWS INTO BALL SETS (colours)
+# 2. CLUSTERING DRAWS INTO BALL SETS
 # =============================================================================
 def cluster_draws(draws, max_k=MAX_K):
-    """
-    Each draw is represented by a 49‑dim normalised count vector (which balls
-    appeared). A Gaussian Mixture Model is fitted for k = 2..max_k and the
-    best k is chosen via BIC. Returns an array of cluster labels (0‑based)
-    and the trained GMM with the chosen k.
-    """
     n = len(draws)
     X = np.zeros((n, NUM_BALLS))
     for i, d in enumerate(draws):
         X[i, d] = 1.0
-    # Normalise each row to sum 1 (draw frequency)
     X = X / X.sum(axis=1, keepdims=True)
 
     best_bic = np.inf
@@ -89,7 +76,7 @@ def cluster_draws(draws, max_k=MAX_K):
     return labels, best_gmm
 
 # =============================================================================
-# 3. ENVIRONMENTAL MODEL (seasonal)
+# 3. ENVIRONMENTAL MODEL
 # =============================================================================
 def get_env_from_date(date):
     month = date.month
@@ -98,7 +85,7 @@ def get_env_from_date(date):
     return temp, hum
 
 # =============================================================================
-# 4. EWMA COUNTS & MASS ESTIMATION (relative, with 1% clipping)
+# 4. EWMA & MASS ESTIMATION
 # =============================================================================
 def update_ewma_counts(prev_counts, draw, decay=EWMA_DECAY):
     new_counts = decay * prev_counts
@@ -114,7 +101,7 @@ def masses_from_counts(counts, nominal=BALL_MASS_NOMINAL, tol_rel=BALL_MASS_TOL_
     return np.clip(raw_mass, nominal - tol_rel, nominal + tol_rel)
 
 # =============================================================================
-# 5. TREND FEATURE (not used actively)
+# 5. TREND (optional)
 # =============================================================================
 def compute_trend_slopes(counts_series, window=TREND_WINDOW):
     if len(counts_series) < window:
@@ -131,7 +118,7 @@ def compute_trend_slopes(counts_series, window=TREND_WINDOW):
     return slopes
 
 # =============================================================================
-# 6. PHYSICS PROBABILITY (scale‑invariant)
+# 6. PHYSICS PROBABILITY
 # =============================================================================
 def physics_probabilities(masses, alpha, temp, hum, beta=0.0, gamma=0.0,
                           trend_slopes=None, delta=0.0):
@@ -143,7 +130,7 @@ def physics_probabilities(masses, alpha, temp, hum, beta=0.0, gamma=0.0,
     return weight / weight.sum()
 
 # =============================================================================
-# 7. DIRICHLET‑MULTINOMIAL LOG‑LIKELIHOOD
+# 7. DIRICHLET‑MULTINOMIAL LIKELIHOOD
 # =============================================================================
 def dirichlet_multinomial_loglike(prob_vec, draw, concentration):
     alpha = concentration * prob_vec
@@ -155,7 +142,7 @@ def dirichlet_multinomial_loglike(prob_vec, draw, concentration):
     return ll
 
 # =============================================================================
-# 8. CROSS‑VALIDATION CALIBRATION (α and concentration) – per cluster
+# 8. CROSS‑VALIDATION CALIBRATION (per cluster)
 # =============================================================================
 def cv_log_likelihood(params, draws_subset, dates_subset, min_history):
     alpha, log_concentration = params
@@ -170,6 +157,7 @@ def cv_log_likelihood(params, draws_subset, dates_subset, min_history):
         draw = draws_subset[i]
         if i >= min_history:
             masses = masses_from_counts(counts)
+            # dates_subset is now a NumPy array of Timestamps
             temp, hum = get_env_from_date(dates_subset[i])
             prob = physics_probabilities(masses, alpha, temp, hum)
             total_ll += dirichlet_multinomial_loglike(prob, draw, concentration)
@@ -178,7 +166,6 @@ def cv_log_likelihood(params, draws_subset, dates_subset, min_history):
 
 def calibrate_parameters(draws_subset, dates_subset, min_history=MIN_HISTORY_FOR_CAL):
     if len(draws_subset) < min_history + 1:
-        # Not enough data – return default values
         return 2.0, 10.0
     x0 = np.array([2.0, np.log(10.0)])
     bounds = [(0.5, 5.0), (np.log(1), np.log(1000))]
@@ -219,22 +206,19 @@ def main():
         print(f"Need at least {MIN_HISTORY_FOR_CAL+1} draws, got {len(draws)}.")
         sys.exit(1)
 
-    # Separate last draw (it will be predicted)
     cal_draws = draws[:-1]
-    cal_dates = dates[:-1]
+    cal_dates = dates[:-1]          # pandas Series
     last_draw = draws[-1]
     last_date = dates.iloc[-1]
     print(f"Using {len(cal_draws)} draws for calibration.")
 
-    # Cluster the calibration draws into ball sets
     print("Clustering draws into ball sets (colours) ...")
     labels, gmm = cluster_draws(cal_draws, max_k=MAX_K)
     n_clusters = gmm.n_components
     cluster_sizes = np.bincount(labels)
     print(f"Cluster sizes: {cluster_sizes}")
 
-    # Build a per‑cluster model
-    cluster_models = []  # list of dicts with masses, alpha, concentration, prob_vec, weight
+    cluster_models = []
     for k in range(n_clusters):
         mask = labels == k
         if cluster_sizes[k] < MIN_HISTORY_FOR_CAL:
@@ -242,51 +226,42 @@ def main():
             continue
 
         draws_k = cal_draws[mask]
-        dates_k = cal_dates[mask]
+        # *** FIX: convert to NumPy array to avoid KeyError on index ***
+        dates_k = cal_dates[mask].values   # NumPy array of Timestamps
         print(f"\n--- Cluster {k} ({cluster_sizes[k]} draws) ---")
 
-        # Calibrate α and concentration on this cluster’s draws
         alpha_k, conc_k = calibrate_parameters(draws_k, dates_k)
         print(f"  α = {alpha_k:.3f}, concentration = {conc_k:.1f}")
 
-        # Estimate masses from all draws in this cluster (using EWMA)
         counts = np.ones(NUM_BALLS) * (DRAW_SIZE / NUM_BALLS)
         for draw in draws_k:
             counts = update_ewma_counts(counts, draw)
         masses_k = masses_from_counts(counts)
         print("  Masses (first 5):", np.round(masses_k[:5], 4))
 
-        # Average environment within cluster (for the probability computation we
-        # use the last known draw's date, but we could also use the mean env of
-        # the cluster. Since env is seasonal and the clusters are spread over
-        # time, it's safer to use the next draw's date env.)
         temp_next, hum_next = get_env_from_date(last_date)
         prob_k = physics_probabilities(masses_k, alpha_k, temp_next, hum_next)
         cluster_models.append({
-            'masses': masses_k,
-            'alpha': alpha_k,
-            'concentration': conc_k,
             'prob': prob_k,
             'weight': cluster_sizes[k] / len(cal_draws)
         })
 
     if not cluster_models:
         print("No cluster has enough data. Falling back to single‑set model.")
-        # fallback to original single‑set model
         counts = np.ones(NUM_BALLS) * (DRAW_SIZE / NUM_BALLS)
         for draw in cal_draws:
             counts = update_ewma_counts(counts, draw)
         masses = masses_from_counts(counts)
-        alpha, conc = calibrate_parameters(cal_draws, cal_dates)
+        alpha, conc = calibrate_parameters(cal_draws, cal_dates.values)
         temp_next, hum_next = get_env_from_date(last_date)
         prob = physics_probabilities(masses, alpha, temp_next, hum_next)
         cluster_models = [{'prob': prob, 'weight': 1.0}]
 
-    # Combine per‑cluster probabilities into one mixture
+    # Weighted average of per‑cluster probabilities
     comb_prob = np.zeros(NUM_BALLS)
     for m in cluster_models:
         comb_prob += m['weight'] * m['prob']
-    comb_prob = comb_prob / comb_prob.sum()  # ensure normalisation
+    comb_prob = comb_prob / comb_prob.sum()
 
     print("\nCombined prediction probabilities (first 10):")
     for i in range(10):
