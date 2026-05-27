@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """
-LottOracle – Unknown Ball Sets (colour changes every draw) [FIXED]
-====================================================================
-Automatically clusters historical draws into groups (ball sets).
-For each cluster, a separate physics model is fitted.
+LottOracle – Unknown Ball Sets (colour changes every draw) [FINAL FIX]
+=======================================================================
+Automatically clusters historical draws into ball set groups.
+For each cluster a separate physics model (EWMA + α calibration) is built.
 Final prediction = weighted average of per‑cluster probabilities.
+
+Compatible with pandas Timestamp and numpy.datetime64.
 """
 
 import numpy as np
@@ -43,7 +45,7 @@ def load_draws_from_csv(filepath):
         if col not in df.columns:
             raise ValueError(f"Missing column: {col}")
     df = df.sort_values("draw_no").reset_index(drop=True)
-    draws = df[["n1", "n2", "n3", "n4", "n5", "n6"]].values - 1  # 0‑indexed
+    draws = df[["n1", "n2", "n3", "n4", "n5", "n6"]].values - 1
     dates = df["date"]
     print(f"Loaded {len(draws)} draws from {filepath}")
     return draws, dates
@@ -76,10 +78,12 @@ def cluster_draws(draws, max_k=MAX_K):
     return labels, best_gmm
 
 # =============================================================================
-# 3. ENVIRONMENTAL MODEL
+# 3. ENVIRONMENTAL MODEL (NOW HANDLES numpy.datetime64)
 # =============================================================================
 def get_env_from_date(date):
-    month = date.month
+    # Convert any date type (datetime, Timestamp, numpy.datetime64) to pd.Timestamp
+    ts = pd.Timestamp(date)
+    month = ts.month
     temp = 25.0 + 5.0 * np.sin(2 * np.pi * (month - 1) / 12)
     hum = 60.0 + 15.0 * np.cos(2 * np.pi * (month - 1) / 12)
     return temp, hum
@@ -101,7 +105,7 @@ def masses_from_counts(counts, nominal=BALL_MASS_NOMINAL, tol_rel=BALL_MASS_TOL_
     return np.clip(raw_mass, nominal - tol_rel, nominal + tol_rel)
 
 # =============================================================================
-# 5. TREND (optional)
+# 5. TREND (optional, not used actively)
 # =============================================================================
 def compute_trend_slopes(counts_series, window=TREND_WINDOW):
     if len(counts_series) < window:
@@ -130,7 +134,7 @@ def physics_probabilities(masses, alpha, temp, hum, beta=0.0, gamma=0.0,
     return weight / weight.sum()
 
 # =============================================================================
-# 7. DIRICHLET‑MULTINOMIAL LIKELIHOOD
+# 7. DIRICHLET‑MULTINOMIAL LOG‑LIKELIHOOD
 # =============================================================================
 def dirichlet_multinomial_loglike(prob_vec, draw, concentration):
     alpha = concentration * prob_vec
@@ -157,7 +161,6 @@ def cv_log_likelihood(params, draws_subset, dates_subset, min_history):
         draw = draws_subset[i]
         if i >= min_history:
             masses = masses_from_counts(counts)
-            # dates_subset is now a NumPy array of Timestamps
             temp, hum = get_env_from_date(dates_subset[i])
             prob = physics_probabilities(masses, alpha, temp, hum)
             total_ll += dirichlet_multinomial_loglike(prob, draw, concentration)
@@ -226,8 +229,8 @@ def main():
             continue
 
         draws_k = cal_draws[mask]
-        # *** FIX: convert to NumPy array to avoid KeyError on index ***
         dates_k = cal_dates[mask].values   # NumPy array of Timestamps
+
         print(f"\n--- Cluster {k} ({cluster_sizes[k]} draws) ---")
 
         alpha_k, conc_k = calibrate_parameters(draws_k, dates_k)
