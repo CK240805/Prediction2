@@ -24,7 +24,7 @@ warnings.filterwarnings("ignore", category=DeprecationWarning)
 # CONFIGURATION
 # =============================================================================
 CSV_FILE = "toto_results2.csv"
-MIN_HISTORY_FOR_CAL = 100
+MIN_HISTORY_FOR_CAL = 41
 NUM_BALLS = 49
 DRAW_SIZE = 6
 
